@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Machine Tracker Dashboard</title>
+
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <!-- Bootstrap Icons -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+
+  <style>
+    #map {
+      height: 400px;
+      margin-bottom: 20px;
+    }
+    .top-bar {
+      background-color: #b52c14;
+      color: white;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    .bottom-bar {
+      background-color: #e9ecef;
+      padding: 10px;
+      text-align: center;
+      border-radius: 8px;
+      margin-top: 20px;
+    }
+    .card .battery-icon {
+      font-size: 1.25rem;
+      vertical-align: middle;
+      margin-right: 5px;
+    }
+    .status-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 5px;
+    }
+    .status-active {
+      background-color: #28a745;
+    }
+    .status-inactive {
+      background-color: #dc3545;
+    }
+    .no-data-message {
+      text-align: center;
+      padding: 2rem;
+      color: #6c757d;
+    }
+    .critical-battery {
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 1; }
+      50% { opacity: 0.5; }
+      100% { opacity: 1; }
+    }
+  </style>
+</head>
+<body class="bg-light">
+  <div class="container mt-4">
+
+    <!-- Top Bar -->
+    <div class="top-bar d-flex justify-content-between align-items-center flex-wrap">
+      <h4 class="mb-2 mb-md-0">Machine Tracking Dashboard</h4>
+      <div class="d-flex gap-2">
+        <select class="form-select" id="batteryFilter" style="width: 150px;">
+          <option value="all">Battery: All</option>
+          <option value="critical">Critical (&lt;10%)</option>
+          <option value="low">Low (10–29%)</option>
+          <option value="medium">Medium (30–74%)</option>
+          <option value="high">High (≥75%)</option>
+        </select>
+        <div class="input-group">
+            <span class="input-group-text"><i class="bi bi-search"></i></span>
+            <input type="text" class="form-control" id="searchInput" placeholder="Search board..." />
+        </div>
+        <button class="btn btn-outline-light d-flex align-items-center gap-2" id="refreshButton">
+            <i class="bi bi-arrow-clockwise"></i> Refresh
+        </button>
+      </div>
+    </div>
+
+    <!-- Map -->
+    <div id="map"></div>
+
+    <!-- Cards -->
+    <h5 class="mb-3">Latest Machine Status</h5>
+    <div id="cards" class="row row-cols-1 row-cols-md-3 g-4"></div>
+
+    <!-- Bottom Bar -->
+    <div class="bottom-bar">
+      <span id="lastUpdated">Last updated: --:--</span> | 
+      <span id="systemStatus">All systems OK</span>
+    </div>
+
+  </div>
+
+  <!-- Bootstrap & Leaflet JS -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <script>
+    let map;
+    let markers = {};
+    let latestData = [];
+    let refreshInterval;
+
+    // Battery status functions with improved thresholds
+    function getBatteryColor(level) {
+      if (level >= 75) return "success";
+      if (level >= 30) return "warning";
+      if (level >= 10) return "danger";
+      return "critical";
+    }
+
+    function getBatteryIcon(level) {
+      if (level >= 75) return "bi-battery-full";
+      if (level >= 50) return "bi-battery-half";
+      if (level >= 30) return "bi-battery";
+      if (level >= 10) return "bi-battery";
+      return "bi-battery-exclamation"; // For critical levels
+    }
+
+    function formatTimestamp(ts) {
+      const date = new Date(ts);
+      return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) + 
+             ' · ' + date.toLocaleDateString([], {month: 'short', day: 'numeric'});
+    }
+
+    function getLatestPerDevice(data) {
+      const map = new Map();
+      data.forEach((item) => {
+        if (!map.has(item.name) || new Date(item.timestamp) > new Date(map.get(item.name).timestamp)) {
+          map.set(item.name, item);
+        }
+      });
+      return Array.from(map.values());
+    }
+
+    function applyFilters() {
+      const batteryFilter = document.getElementById("batteryFilter").value;
+      const searchValue = document.getElementById("searchInput").value.toLowerCase();
+
+      return latestData.filter(machine => {
+        const battery = machine.battery;
+        const name = machine.name.toLowerCase();
+        const id = machine.id?.toString().toLowerCase() || "";
+
+        const batteryPass =
+          batteryFilter === "all" ||
+          (batteryFilter === "critical" && battery < 10) ||
+          (batteryFilter === "low" && battery >= 10 && battery < 30) ||
+          (batteryFilter === "medium" && battery >= 30 && battery < 75) ||
+          (batteryFilter === "high" && battery >= 75);
+
+        const searchPass = name.includes(searchValue) || id.includes(searchValue);
+
+        return batteryPass && searchPass;
+      });
+    }
+
+    function updateUI(filteredData) {
+      const cardsContainer = document.getElementById("cards");
+      const lastUpdated = document.getElementById("lastUpdated");
+      const systemStatus = document.getElementById("systemStatus");
+
+      cardsContainer.innerHTML = "";
+
+      // Clear existing markers
+      if (map && markers) {
+        Object.values(markers).forEach(marker => map.removeLayer(marker));
+      }
+      markers = {};
+
+      // Initialize map if not done
+      if (!map) {
+        map = L.map("map").setView([48.993, 12.101], 13);
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+      }
+
+      // Handle empty state
+      if (filteredData.length === 0) {
+        cardsContainer.innerHTML = `
+          <div class="col-12">
+            <div class="no-data-message">
+              <i class="bi bi-exclamation-circle display-5 mb-3"></i>
+              <h5>No machines found</h5>
+              <p>Try adjusting your filters or search term</p>
+            </div>
+          </div>
+        `;
+        lastUpdated.textContent = "Last updated: --:--";
+        systemStatus.textContent = "No active machines";
+        systemStatus.className = "text-danger";
+        return;
+      }
+
+      const bounds = [];
+      let anyCritical = false;
+      let latestTimestamp = null;
+
+      filteredData.forEach(machine => {
+        // Update latest timestamp
+        const timestamp = new Date(machine.timestamp);
+        if (!latestTimestamp || timestamp > latestTimestamp) {
+          latestTimestamp = timestamp;
+        }
+        
+        // Check for critical battery
+        if (machine.battery < 10) {
+          anyCritical = true;
+        }
+
+        const latlng = [machine.latitude, machine.longitude];
+        bounds.push(latlng);
+
+        // Create marker
+        const marker = L.marker(latlng).addTo(map);
+        marker.bindPopup(`
+          <b>${machine.name}</b><br>
+          ${machine.id ? `ID: ${machine.id}<br>` : ''}
+          Battery: <i class="bi ${getBatteryIcon(machine.battery)} text-${getBatteryColor(machine.battery)}"></i> 
+          <span class="text-${getBatteryColor(machine.battery)}">${machine.battery}%</span><br>
+          Satellites: ${machine.satellites}<br>
+          Last seen: ${formatTimestamp(machine.timestamp)}
+        `);
+        markers[machine.name] = marker;
+
+        // Determine status indicator
+        const isActive = (Date.now() - timestamp) < 30 * 60 * 1000; // 30 minutes threshold
+        const statusClass = isActive ? "status-active" : "status-inactive";
+        const batteryColor = getBatteryColor(machine.battery);
+        const isCritical = batteryColor === "critical";
+
+        // Add card with battery-specific styling
+        cardsContainer.innerHTML += `
+          <div class="col">
+            <div class="card h-100 ${isCritical ? 'critical-battery border-danger' : ''}">
+              <div class="card-body">
+                <div class="d-flex justify-content-between">
+                  <h5 class="card-title">${machine.name}</h5>
+                  <span class="${statusClass} status-indicator" title="${isActive ? 'Active' : 'Inactive'}"></span>
+                </div>
+                ${machine.id ? `<p class="card-text text-muted small">ID: ${machine.id}</p>` : ''}
+                <p class="card-text">
+                  <i class="bi ${getBatteryIcon(machine.battery)} battery-icon text-${batteryColor}"></i>
+                  Battery: <span class="text-${batteryColor}">${machine.battery}%</span>
+                </p>
+                <p class="card-text">
+                  <i class="bi bi-satellite"></i> Satellites: ${machine.satellites}
+                </p>
+                <p class="card-text"><small class="text-muted">Updated: ${formatTimestamp(machine.timestamp)}</small></p>
+              </div>
+            </div>
+          </div>
+        `;
+      });
+
+      // Update map view
+      if (bounds.length > 0) {
+        map.fitBounds(bounds, {
+          padding: [50, 50],
+          maxZoom: 18
+        });
+      }
+
+      // Update status bar
+      lastUpdated.textContent = `Last updated: ${latestTimestamp.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`;
+      
+      if (anyCritical) {
+        systemStatus.innerHTML = '<i class="bi bi-exclamation-triangle-fill"></i> CRITICAL: Low battery detected';
+        systemStatus.className = "text-danger fw-bold";
+      } else {
+        systemStatus.innerHTML = '<i class="bi bi-check-circle-fill"></i> All systems OK';
+        systemStatus.className = "text-success";
+      }
+    }
+
+    async function loadData() {
+      try {
+        const refreshBtn = document.getElementById("refreshButton");
+        refreshBtn.disabled = true;
+        refreshBtn.innerHTML = '<i class="bi bi-arrow-repeat me-2"></i> Loading...';
+        
+        const response = await fetch("http://127.0.0.1:5000/api/machines");
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        
+        const data = await response.json();
+        latestData = getLatestPerDevice(data);
+        updateUI(applyFilters());
+      } catch (err) {
+        console.error("Fetch error:", err);
+        document.getElementById("systemStatus").innerHTML = '<i class="bi bi-exclamation-triangle-fill"></i> Error fetching data';
+        document.getElementById("systemStatus").className = "text-danger";
+      } finally {
+        const refreshBtn = document.getElementById("refreshButton");
+        refreshBtn.disabled = false;
+        refreshBtn.innerHTML = '<i class="bi bi-arrow-clockwise me-2"></i> Refresh';
+      }
+    }
+
+    function setupAutoRefresh(interval = 30000) {
+      if (refreshInterval) clearInterval(refreshInterval);
+      refreshInterval = setInterval(loadData, interval);
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+      // Initialize UI components
+      document.getElementById("batteryFilter").addEventListener("change", () => updateUI(applyFilters()));
+      document.getElementById("searchInput").addEventListener("input", () => updateUI(applyFilters()));
+      document.getElementById("refreshButton").addEventListener("click", loadData);
+      
+      // Start with loading data
+      loadData();
+      
+      // Setup auto-refresh every 30 seconds
+      setupAutoRefresh();
+    });
+  </script>
+</body>
+</html>
